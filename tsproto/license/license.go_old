@@ -1,0 +1,218 @@
+package license
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/binary"
+
+	"filippo.io/edwards25519"
+	"github.com/aead/ecdh"
+	"github.com/pkg/errors"
+	"golang.org/x/crypto/curve25519"
+
+	"github.com/bzp2010/ts3protocol/tsproto/packets"
+)
+
+const (
+	ValidDataDifference = 1356998400
+)
+
+var (
+	rootKey, _ = (&edwards25519.Point{}).SetBytes([]byte{
+		0xcd, 0x0d, 0xe2, 0xae, 0xd4, 0x63, 0x45, 0x50,
+		0x9a, 0x7e, 0x3c, 0xfd, 0x8f, 0x68, 0xb3, 0xdc,
+		0x75, 0x55, 0xb2, 0x9d, 0xcc, 0xec, 0x73, 0xcd,
+		0x18, 0x75, 0x0f, 0x99, 0x38, 0x12, 0x40, 0x8a,
+	})
+)
+
+// NewDefaultLicense will create an empty license that contains only Server and Ephemeral
+func NewDefaultLicense() License {
+	license := License{
+		LicenseVersion: 0x01,
+	}
+
+	// Add Server block
+	license.AddLicenseBlock(Block{
+		BlockType:        2,
+		MinimumValidData: ValidDataDifference,
+		MaximumValidData: 4294967295,
+		Content:          NewServerBlock(7),
+	})
+
+	// Add Ephemeral block
+	license.AddLicenseBlock(Block{
+		BlockType:        32,
+		MinimumValidData: ValidDataDifference,
+		MaximumValidData: 4294967295,
+		Content:          NewEphemeralBlock(),
+	})
+
+	return license
+}
+
+type License struct {
+	// 01 bytes : License version
+	//            Const: 0x01
+	LicenseVersion byte
+	Blocks         []Block
+}
+
+type fixedReader struct {
+	Value []byte
+}
+
+func (f fixedReader) Read(p []byte) (n int, err error) {
+	if len(p) > len(f.Value) {
+		return 0, errors.New("too long data was read")
+	}
+
+	copy(p, f.Value)
+
+	return len(p), nil
+}
+
+func (l *License) nextKeypair() (ed25519.PrivateKey, ed25519.PublicKey, error) {
+	var (
+		parent     = rootKey // Next publicKey
+		b          []byte    // Raw block data
+		privateKey [32]byte  // Generated privateKey
+		publicKey  [32]byte
+		err        error
+	)
+
+	for _, block := range l.Blocks {
+		b, err = block.Marshal()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		privateKey = *(*[32]byte)(b[1:33])
+		//privateKey[0] &= 248
+		//privateKey[31] &= 127
+		//privateKey[31] |= 64
+
+		// Generate relative public key
+		priKey, pubKey, err := ecdh.X25519().GenerateKey(fixedReader{Value: privateKey[:]})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		next, err := curve25519.X25519(privateKey[:], publicKey[:])
+		if err != nil {
+			return nil, nil, err
+		}
+		next = next + parent
+
+		nextPoint, err := new(edwards25519.Point).SetBytes(next)
+		parent = nextPoint.Add(nextPoint, parent)
+	}
+
+	return privateKey[:], parent.Bytes(), nil
+
+	/*for _, block := range l.Blocks {
+		b, err = block.Marshal()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		privateKey = *(*[32]byte)(b[1:33])
+		privateKey[0] &= 248
+		privateKey[31] &= 127
+		privateKey[31] |= 64
+
+		// Generate relative public key
+		curve25519.ScalarBaseMult(&publicKey, &privateKey)
+
+		next, err := curve25519.X25519(privateKey[:], publicKey[:])
+		if err != nil {
+			return nil, nil, err
+		}
+
+		nextPoint, err := new(edwards25519.Point).SetBytes(next)
+		parent = nextPoint.Add(nextPoint, parent)
+	}
+
+	return privateKey[:], parent.Bytes(), nil*/
+}
+
+// AddLicenseBlock will add a block to license
+// The input block needs to contain BlockType, MinimumValidData, MaximumValidData and Content data
+func (l *License) AddLicenseBlock(b Block) {
+	ptr := &b
+	nextPrivateKey, nextPublicKey, err := l.nextKeypair()
+	if err != nil {
+		panic(err)
+	}
+
+	ptr.KeyType = 0x00
+	ptr.PrivateKey = nextPrivateKey
+	ptr.PublicKey = nextPublicKey
+	ptr.MinimumValidData = ptr.MinimumValidData - ValidDataDifference
+	ptr.MaximumValidData = ptr.MaximumValidData - ValidDataDifference
+
+	l.Blocks = append(l.Blocks, *ptr)
+}
+
+func (l *License) Marshal() ([]byte, error) {
+	data := []byte{l.LicenseVersion}
+	for _, block := range l.Blocks {
+		b, err := block.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, b...)
+	}
+	return data, nil
+}
+
+// GetServerEKPrivateKey returns the private key corresponding to the public key of License.
+// The client uses it as serverEK, the Ed25519 public key of the server, to implement ECDH key exchange.
+func (l *License) GetServerEKPrivateKey() *ed25519.PrivateKey {
+	return &l.Blocks[len(l.Blocks)-1].PrivateKey
+}
+
+// Block part of License
+type Block struct {
+	// 01 bytes : Key type
+	//            Const: 0x00
+	KeyType byte
+	// 32 bytes : Block public key
+	PublicKey ed25519.PublicKey
+	// 01 bytes : License block type
+	BlockType byte
+	// 04 bytes : Not valid before date
+	MinimumValidData uint32
+	// 04 bytes : Not valid after date
+	MaximumValidData uint32
+	// var bytes : (Content from the block type)
+	Content BlockContent
+
+	PrivateKey ed25519.PrivateKey
+}
+
+func (b Block) Marshal() ([]byte, error) {
+	minimum := make([]byte, 4)
+	binary.BigEndian.PutUint32(minimum, b.MinimumValidData)
+
+	maximum := make([]byte, 4)
+	binary.BigEndian.PutUint32(maximum, b.MaximumValidData)
+
+	content, err := b.Content.Marshal()
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.Join([][]byte{{b.KeyType}, b.PublicKey, {b.BlockType}, minimum, maximum, content}, []byte{}), nil
+}
+
+func (b Block) Unmarshal(bytes []byte) error {
+	//TODO implement me
+	panic("implement me")
+}
+
+type BlockContent interface {
+	packets.Marshaler
+	packets.Unmarshaler
+	isLicenseBlockContent()
+}
